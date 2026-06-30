@@ -1,0 +1,491 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Unit tests for profile-backed deterministic routing construction."""
+
+from __future__ import annotations
+
+from typing import Any
+
+import pytest
+from pydantic import ValidationError
+
+from switchyard.lib.backends.deterministic_routing_llm_backend import (
+    DeterministicRoutingLLMBackend,
+)
+from switchyard.lib.backends.llm_target import BackendFormat, LlmTarget
+from switchyard.lib.processors.llm_classifier import (
+    LLMClassifierRequestProcessor,
+    SignalTierSelectorRequestProcessor,
+)
+from switchyard.lib.processors.stats_request_processor import StatsRequestProcessor
+from switchyard.lib.processors.stats_response_processor_accumulator import (
+    StatsResponseProcessor,
+)
+from switchyard.lib.profiles import (
+    DeterministicRoutingConfig,
+    DeterministicRoutingPresets,
+    DeterministicRoutingProfileConfig,
+    ProfileSwitchyard,
+)
+from switchyard.lib.profiles.deterministic_routing_profile_config import (
+    _apply_deepseek_overrides,
+    _apply_default_tier_timeout,
+)
+from switchyard.lib.proxy_context import ProxyContext
+from switchyard.lib.route_table_builders import deterministic_routing_virtual_model_id
+from switchyard.lib.stats_accumulator import StatsAccumulator
+from switchyard_rust.core import ChatRequest, ChatResponse
+from switchyard_rust.translation import TranslationEngine
+
+
+def _config(
+    *,
+    profile_name: str = "coding_agent",
+    enable_stats: bool = True,
+    classifier_min_confidence: float = 0.0,
+    classifier_model: str = "nvidia/deepseek-ai/deepseek-v4-flash",
+    classifier_system_prompt: str | None = None,
+    classifier_max_request_chars: int = 16_000,
+    session_affinity: bool = False,
+    affinity_max_sessions: int = 10_000,
+    affinity_warmup_turns: int = 0,
+) -> DeterministicRoutingConfig:
+    return DeterministicRoutingConfig(
+        strong=LlmTarget(
+            id="strong",
+            model="aws/anthropic/bedrock-claude-opus-4-7",
+            format=BackendFormat.OPENAI,
+            api_key="sk-test",
+            base_url="https://example.invalid/v1",
+        ),
+        weak=LlmTarget(
+            id="weak",
+            model="nvidia/deepseek-ai/evals-deepseek-v4-pro",
+            format=BackendFormat.OPENAI,
+            api_key="sk-test",
+            base_url="https://example.invalid/v1",
+        ),
+        classifier=LlmTarget(
+            id="classifier",
+            model=classifier_model,
+            format=BackendFormat.OPENAI,
+            api_key="sk-test",
+            base_url="https://example.invalid/v1",
+        ),
+        profile_name=profile_name,  # type: ignore[arg-type]
+        classifier_min_confidence=classifier_min_confidence,
+        classifier_system_prompt=classifier_system_prompt,
+        classifier_max_request_chars=classifier_max_request_chars,
+        enable_stats=enable_stats,
+        fallback_target_on_evict="strong",
+        session_affinity=session_affinity,
+        affinity_max_sessions=affinity_max_sessions,
+        affinity_warmup_turns=affinity_warmup_turns,
+    )
+
+
+def _deterministic_routing_switchyard(
+    config: DeterministicRoutingConfig,
+    *,
+    stats_accumulator: StatsAccumulator | None = None,
+    pre_routing_request_processors: list[Any] | None = None,
+    extra_request_processors: list[Any] | None = None,
+    extra_response_processors: list[Any] | None = None,
+) -> ProfileSwitchyard:
+    """Build the profile-backed runtime used by these tests."""
+    return ProfileSwitchyard(
+        DeterministicRoutingProfileConfig.from_config(config)
+        .build()
+        .with_runtime_components(
+            stats_accumulator=stats_accumulator,
+            enable_stats=config.enable_stats,
+            pre_request_processors=pre_routing_request_processors or (),
+            post_request_processors=extra_request_processors or (),
+            response_processors=extra_response_processors or (),
+        )
+    )
+
+
+class _NoopRequestProcessor:
+    async def process(self, _ctx: ProxyContext, request: ChatRequest) -> ChatRequest:
+        return request
+
+
+class _NoopResponseProcessor:
+    async def process(self, _ctx: ProxyContext, response: ChatResponse) -> ChatResponse:
+        return response
+
+
+class TestProfileStructure:
+    def test_returns_profile_backed_switchyard_adapter(self) -> None:
+        switchyard = _deterministic_routing_switchyard(_config())
+        assert isinstance(switchyard, ProfileSwitchyard)
+
+    def test_backend_is_deterministic_routing(self) -> None:
+        switchyard = _deterministic_routing_switchyard(_config())
+        backends = [
+            c for c in switchyard.iter_components()
+            if isinstance(c, DeterministicRoutingLLMBackend)
+        ]
+        assert len(backends) == 1
+
+    def test_classifier_processor_present(self) -> None:
+        switchyard = _deterministic_routing_switchyard(_config())
+        classifiers = [
+            c for c in switchyard.iter_components()
+            if isinstance(c, LLMClassifierRequestProcessor)
+        ]
+        assert len(classifiers) == 1
+
+    def test_classifier_processor_uses_prompt_and_context_overrides(self) -> None:
+        switchyard = _deterministic_routing_switchyard(
+            _config(
+                classifier_system_prompt="custom classifier prompt",
+                classifier_max_request_chars=1024,
+            ),
+        )
+        classifier = next(
+            c for c in switchyard.iter_components()
+            if isinstance(c, LLMClassifierRequestProcessor)
+        )
+        assert classifier._config.system_prompt == "custom classifier prompt"
+        assert classifier._config.max_request_chars == 1024
+
+    def test_tier_selector_processor_present(self) -> None:
+        switchyard = _deterministic_routing_switchyard(_config())
+        selectors = [
+            c for c in switchyard.iter_components()
+            if isinstance(c, SignalTierSelectorRequestProcessor)
+        ]
+        assert len(selectors) == 1
+
+    def test_affinity_warmup_reaches_shared_processors(self) -> None:
+        switchyard = _deterministic_routing_switchyard(
+            _config(session_affinity=True, affinity_warmup_turns=2),
+        )
+        classifier = next(
+            c for c in switchyard.iter_components()
+            if isinstance(c, LLMClassifierRequestProcessor)
+        )
+        selector = next(
+            c for c in switchyard.iter_components()
+            if isinstance(c, SignalTierSelectorRequestProcessor)
+        )
+        assert classifier._affinity is selector._affinity
+        assert classifier._affinity is not None
+        assert classifier._affinity.warmup_turns == 2
+
+    def test_translator_present(self) -> None:
+        switchyard = _deterministic_routing_switchyard(_config())
+        translators = [
+            c for c in switchyard.iter_components()
+            if isinstance(c, TranslationEngine)
+        ]
+        assert len(translators) == 1
+
+    def test_classifier_runs_before_tier_selector(self) -> None:
+        switchyard = _deterministic_routing_switchyard(_config())
+        components = list(switchyard.iter_components())
+        classifier_idx = next(
+            idx for idx, c in enumerate(components)
+            if isinstance(c, LLMClassifierRequestProcessor)
+        )
+        selector_idx = next(
+            idx for idx, c in enumerate(components)
+            if isinstance(c, SignalTierSelectorRequestProcessor)
+        )
+        assert classifier_idx < selector_idx
+
+    def test_stats_processors_wired_when_enabled(self) -> None:
+        switchyard = _deterministic_routing_switchyard(_config())
+        assert any(
+            isinstance(c, StatsRequestProcessor)
+            for c in switchyard.iter_components()
+        )
+        assert any(
+            isinstance(c, StatsResponseProcessor)
+            for c in switchyard.iter_components()
+        )
+
+    def test_stats_processors_absent_when_disabled(self) -> None:
+        switchyard = _deterministic_routing_switchyard(
+            _config(enable_stats=False),
+        )
+        assert not any(
+            isinstance(c, StatsRequestProcessor)
+            for c in switchyard.iter_components()
+        )
+        assert not any(
+            isinstance(c, StatsResponseProcessor)
+            for c in switchyard.iter_components()
+        )
+
+    def test_extra_processors_are_wired(self) -> None:
+        request_processor = _NoopRequestProcessor()
+        response_processor = _NoopResponseProcessor()
+        switchyard = _deterministic_routing_switchyard(
+            _config(),
+            extra_request_processors=[request_processor],
+            extra_response_processors=[response_processor],
+        )
+        components = list(switchyard.iter_components())
+        assert request_processor in components
+        assert response_processor in components
+
+    def test_pre_routing_runs_before_classifier(self) -> None:
+        pre = _NoopRequestProcessor()
+        switchyard = _deterministic_routing_switchyard(
+            _config(),
+            pre_routing_request_processors=[pre],
+        )
+        components = list(switchyard.iter_components())
+        stats_idx = next(
+            idx for idx, c in enumerate(components)
+            if isinstance(c, StatsRequestProcessor)
+        )
+        pre_idx = components.index(pre)
+        classifier_idx = next(
+            idx for idx, c in enumerate(components)
+            if isinstance(c, LLMClassifierRequestProcessor)
+        )
+        assert stats_idx < pre_idx < classifier_idx
+
+    async def test_shared_stats_accumulator(self) -> None:
+        """Recording on the shared accumulator must surface in the response processor."""
+        stats = StatsAccumulator()
+        switchyard = _deterministic_routing_switchyard(
+            _config(),
+            stats_accumulator=stats,
+        )
+        response_processor = next(
+            c for c in switchyard.iter_components()
+            if isinstance(c, StatsResponseProcessor)
+        )
+        await stats.record_success("aws/anthropic/bedrock-claude-opus-4-7")
+        assert response_processor.accumulator.snapshot_sync()["total_requests"] == 1
+
+
+class TestStderrSuppression:
+    """The launcher path shares stderr with the spawned agent's TUI, so the
+    classifier processor's ``classifier_signals=...`` dump must be off when the
+    profile builds the chain (benchmark callers still get it via the
+    ``LLMClassifierConfig.dump_signals_to_stderr=True`` default)."""
+
+    def test_profile_disables_classifier_stderr_dump(self) -> None:
+        switchyard = _deterministic_routing_switchyard(_config())
+        classifier = next(
+            c for c in switchyard.iter_components()
+            if isinstance(c, LLMClassifierRequestProcessor)
+        )
+        assert classifier._config.dump_signals_to_stderr is False
+
+
+class TestClassifierReasoningHint:
+    def _classifier(self, config: DeterministicRoutingConfig) -> LLMClassifierRequestProcessor:
+        switchyard = _deterministic_routing_switchyard(config)
+        return next(
+            c for c in switchyard.iter_components()
+            if isinstance(c, LLMClassifierRequestProcessor)
+        )
+
+    def test_bedrock_claude_classifier_disables_reasoning(self) -> None:
+        classifier = self._classifier(
+            _config(classifier_model="aws/anthropic/bedrock-claude-sonnet-4-6"),
+        )
+        assert classifier._config.disable_reasoning is False
+
+    def test_deepseek_classifier_keeps_reasoning_disabled(self) -> None:
+        classifier = self._classifier(
+            _config(classifier_model="nvidia/deepseek-ai/deepseek-v4-flash"),
+        )
+        assert classifier._config.disable_reasoning is True
+
+
+class TestProfileSelection:
+    @pytest.mark.parametrize("profile", ["general", "coding_agent", "openclaw"])
+    def test_known_profiles_build(self, profile: str) -> None:
+        switchyard = _deterministic_routing_switchyard(
+            _config(profile_name=profile),
+        )
+        assert isinstance(switchyard, ProfileSwitchyard)
+
+    def test_unknown_profile_rejected_at_config_construction(self) -> None:
+        with pytest.raises(ValueError):
+            DeterministicRoutingConfig(
+                strong={"model": "s"},
+                weak={"model": "w"},
+                classifier={"model": "c"},
+                profile_name="invented_profile",  # type: ignore[arg-type]
+                fallback_target_on_evict="strong",
+            )
+
+
+class TestDeepSeekOverrides:
+    """The profile layers DeepSeek-specific extras onto tier targets."""
+
+    def test_deepseek_v4_pro_gets_thinking_off(self) -> None:
+        target = LlmTarget(
+            id="weak",
+            model="nvidia/deepseek-ai/evals-deepseek-v4-pro",
+            format=BackendFormat.OPENAI,
+            api_key="k",
+            base_url="https://e/v1",
+        )
+        out = _apply_deepseek_overrides(target)
+        assert out.extra_body == {"chat_template_kwargs": {"enable_thinking": False}}
+
+    def test_deepseek_gets_batch_priority_header(self) -> None:
+        target = LlmTarget(
+            id="weak",
+            model="nvidia/deepseek-ai/deepseek-v4-flash",
+            format=BackendFormat.OPENAI,
+            api_key="k",
+            base_url="https://e/v1",
+        )
+        out = _apply_deepseek_overrides(target)
+        assert out.extra_headers == {"X-Inference-Priority": "batch"}
+
+    def test_non_deepseek_passes_through_unchanged(self) -> None:
+        target = LlmTarget(
+            id="strong",
+            model="aws/anthropic/bedrock-claude-opus-4-7",
+            format=BackendFormat.OPENAI,
+            api_key="k",
+            base_url="https://e/v1",
+        )
+        out = _apply_deepseek_overrides(target)
+        assert out is target  # no rebuild needed
+
+    def test_caller_supplied_extras_win(self) -> None:
+        target = LlmTarget(
+            id="weak",
+            model="nvidia/deepseek-ai/evals-deepseek-v4-pro",
+            format=BackendFormat.OPENAI,
+            api_key="k",
+            base_url="https://e/v1",
+            extra_body={"chat_template_kwargs": {"enable_thinking": True}},
+            extra_headers={"X-Inference-Priority": "interactive"},
+        )
+        out = _apply_deepseek_overrides(target)
+        assert out.extra_body == {"chat_template_kwargs": {"enable_thinking": True}}
+        assert out.extra_headers == {"X-Inference-Priority": "interactive"}
+
+    def test_caller_supplied_empty_body_wins(self) -> None:
+        target = LlmTarget(
+            id="weak",
+            model="nvidia/deepseek-ai/evals-deepseek-v4-pro",
+            format=BackendFormat.OPENAI,
+            api_key="k",
+            base_url="https://e/v1",
+            extra_body={},
+        )
+        out = _apply_deepseek_overrides(target)
+        assert out.extra_body == {}
+
+
+class TestTierTimeoutDefaults:
+    """Deterministic tiers get a bounded timeout unless callers set one."""
+
+    def test_default_timeout_applies_when_target_has_no_timeout(self) -> None:
+        target = LlmTarget(
+            id="strong",
+            model="aws/anthropic/bedrock-claude-opus-4-7",
+            format=BackendFormat.OPENAI,
+            api_key="k",
+            base_url="https://e/v1",
+        )
+
+        out = _apply_default_tier_timeout(target, 123.0)
+
+        assert out.endpoint.timeout_secs == 123.0
+
+    def test_existing_timeout_wins(self) -> None:
+        target = LlmTarget(
+            id="strong",
+            model="aws/anthropic/bedrock-claude-opus-4-7",
+            format=BackendFormat.OPENAI,
+            api_key="k",
+            base_url="https://e/v1",
+            timeout_secs=45.0,
+        )
+
+        out = _apply_default_tier_timeout(target, 123.0)
+
+        assert out is target
+        assert out.endpoint.timeout_secs == 45.0
+
+    def test_none_disables_default_timeout(self) -> None:
+        target = LlmTarget(
+            id="strong",
+            model="aws/anthropic/bedrock-claude-opus-4-7",
+            format=BackendFormat.OPENAI,
+            api_key="k",
+            base_url="https://e/v1",
+        )
+
+        out = _apply_default_tier_timeout(target, None)
+
+        assert out is target
+        assert out.endpoint.timeout_secs is None
+
+
+class TestPresetIntegration:
+    """Profile round-trip with the shipping preset."""
+
+    def test_preset_builds_profile(self) -> None:
+        config = DeterministicRoutingPresets.coding_agent_default(api_key="nvapi-test")
+        switchyard = _deterministic_routing_switchyard(config)
+        backends = [
+            c for c in switchyard.iter_components()
+            if isinstance(c, DeterministicRoutingLLMBackend)
+        ]
+        assert len(backends) == 1
+
+    def test_preset_metadata_round_trips(self) -> None:
+        config = DeterministicRoutingPresets.coding_agent_default(api_key="nvapi-test")
+        assert config.preset == "coding_agent_default"
+        assert config.profile_name == "coding_agent"
+        assert config.strong.model == "anthropic/claude-opus-4.7"
+        assert config.weak.model == "moonshotai/kimi-k2.6"
+        assert config.classifier.model == "google/gemini-3.5-flash"
+
+    def test_preset_uses_openai_compatible_formats(self) -> None:
+        # OpenRouter's default surface is OpenAI-compatible chat completions.
+        config = DeterministicRoutingPresets.coding_agent_default(api_key="nvapi-test")
+        assert config.strong.format is BackendFormat.OPENAI
+        assert config.weak.format is BackendFormat.OPENAI
+        assert config.classifier.format is BackendFormat.OPENAI
+
+
+def test_session_affinity_requires_nonzero_capacity() -> None:
+    """Enabling affinity with a zero-capacity store is rejected as a footgun."""
+    with pytest.raises(ValidationError):
+        _config(session_affinity=True, affinity_max_sessions=0)
+    # Enabled with capacity, or disabled with zero, are both fine.
+    _config(session_affinity=True, affinity_max_sessions=1)
+    _config(session_affinity=False, affinity_max_sessions=0)
+
+
+def test_affinity_warmup_turns_must_be_non_negative() -> None:
+    with pytest.raises(ValidationError):
+        _config(session_affinity=True, affinity_warmup_turns=-1)
+
+
+def test_blank_classifier_prompt_is_treated_as_unset() -> None:
+    config = _config(classifier_system_prompt="   ")
+    assert config.classifier_system_prompt is None
+
+
+def test_virtual_model_id_changes_with_prompt_and_context() -> None:
+    base = _config()
+    base_id = deterministic_routing_virtual_model_id(base)
+    prompt_id = deterministic_routing_virtual_model_id(
+        _config(classifier_system_prompt="custom classifier prompt"),
+    )
+    max_chars_id = deterministic_routing_virtual_model_id(
+        _config(classifier_max_request_chars=1024),
+    )
+
+    assert prompt_id != base_id
+    assert max_chars_id != base_id

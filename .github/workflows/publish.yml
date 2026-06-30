@@ -1,0 +1,250 @@
+name: Build and publish release distributions
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+env:
+  MATURIN_VERSION: "1.11.5"
+  # Delete this variable when public GitHub/PyPI publishing is officially enabled.
+  SWITCHYARD_GITHUB_PUBLISH_DISABLED: "1"
+
+permissions:
+  contents: read
+
+jobs:
+  python-release-checks:
+    name: Release Python checks (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      - run: uv sync --locked
+      - name: Run lint checks
+        run: uv run ruff check .
+      - name: Run tests
+        run: uv run pytest tests/ -v -x -m "not integration"
+
+  rust-release-checks:
+    name: Release Rust checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust components
+        run: rustup component add rustfmt clippy
+      - name: cargo fmt
+        run: cargo fmt --all --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo test
+        run: cargo test --workspace
+
+  source-dist:
+    name: Source distribution
+    needs: [python-release-checks, rust-release-checks]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      - run: uv sync --locked
+      - name: Build sdist
+        run: uv run maturin sdist --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: switchyard-sdist
+          path: dist/*
+
+  wheels:
+    name: Wheel (${{ matrix.label }})
+    needs: [python-release-checks, rust-release-checks]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64
+            os: ubuntu-latest
+            rust_target: x86_64-unknown-linux-gnu
+            manylinux_arch: x86_64
+            smoke: true
+          - label: linux-aarch64
+            os: ubuntu-latest
+            rust_target: aarch64-unknown-linux-gnu
+            manylinux_arch: aarch64
+            smoke: false
+          - label: macos-x86_64
+            os: macos-15-intel
+            rust_target: x86_64-apple-darwin
+            smoke: true
+          - label: macos-arm64
+            os: macos-14
+            rust_target: aarch64-apple-darwin
+            smoke: true
+          - label: windows-x86_64
+            os: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            smoke: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Setup QEMU for Linux cross builds
+        if: matrix.label == 'linux-aarch64'
+        uses: docker/setup-qemu-action@v3
+      - name: Install maturin
+        if: runner.os != 'Linux'
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "maturin==${MATURIN_VERSION}"
+      - name: Install Rust target
+        if: runner.os != 'Linux'
+        shell: bash
+        run: rustup target add "${{ matrix.rust_target }}"
+      - name: Build manylinux wheel
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker run --rm \
+            -e MATURIN_VERSION="${MATURIN_VERSION}" \
+            -v "${GITHUB_WORKSPACE}:/io" \
+            -w /io \
+            "quay.io/pypa/manylinux2014_${{ matrix.manylinux_arch }}" \
+            /bin/bash -lc '
+              set -euxo pipefail
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+              source "${HOME}/.cargo/env"
+              PYTHON=/opt/python/cp312-cp312/bin/python
+              "${PYTHON}" -m pip install --upgrade pip
+              "${PYTHON}" -m pip install "maturin==${MATURIN_VERSION}"
+              "${PYTHON}" -m maturin build \
+                --release \
+                --locked \
+                --compatibility pypi \
+                --out dist \
+                --interpreter "${PYTHON}"
+            '
+      - name: Build native wheel
+        if: runner.os != 'Linux'
+        shell: bash
+        run: |
+          python -m maturin build \
+            --release \
+            --locked \
+            --compatibility pypi \
+            --out dist \
+            --target "${{ matrix.rust_target }}"
+      - name: Smoke install native wheel on Python 3.12
+        if: matrix.smoke
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --force-reinstall dist/*.whl
+          python - <<'PY'
+          import os
+          import sys
+          import tempfile
+
+          os.chdir(tempfile.mkdtemp(prefix="switchyard-wheel-smoke-"))
+          workspace = os.environ.get("GITHUB_WORKSPACE")
+          sys.path = [entry for entry in sys.path if entry not in ("", workspace)]
+
+          import switchyard
+          import switchyard_rust
+          from switchyard_rust import _switchyard_rust
+
+          print("switchyard", switchyard.__version__)
+          print("switchyard_rust", switchyard_rust.__file__)
+          print("rust extension", _switchyard_rust.__name__)
+          PY
+      - uses: actions/setup-python@v5
+        if: matrix.smoke
+        with:
+          python-version: "3.14"
+      - name: Smoke install native wheel on Python 3.14
+        if: matrix.smoke
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --force-reinstall dist/*.whl
+          python - <<'PY'
+          import os
+          import sys
+          import tempfile
+
+          os.chdir(tempfile.mkdtemp(prefix="switchyard-wheel-smoke-"))
+          workspace = os.environ.get("GITHUB_WORKSPACE")
+          sys.path = [entry for entry in sys.path if entry not in ("", workspace)]
+
+          import switchyard
+          import switchyard_rust
+          from switchyard_rust import _switchyard_rust
+
+          print("switchyard", switchyard.__version__)
+          print("switchyard_rust", switchyard_rust.__file__)
+          print("rust extension", _switchyard_rust.__name__)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: switchyard-wheel-${{ matrix.label }}
+          path: dist/*
+
+  list-distributions:
+    name: List distributions
+    needs: [source-dist, wheels]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: switchyard-*
+          merge-multiple: true
+      - name: List distributions
+        run: ls -l dist
+
+  publish:
+    name: Publish distributions
+    if: ${{ env.SWITCHYARD_GITHUB_PUBLISH_DISABLED == '' }}
+    needs: [source-dist, wheels]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: switchyard-*
+          merge-multiple: true
+      - name: List distributions
+        run: ls -l dist
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          draft: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

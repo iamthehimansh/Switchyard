@@ -1,0 +1,146 @@
+name: Perf Benchmark
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      concurrency:
+        description: "aiperf --concurrency"
+        default: "10"
+      request_count:
+        description: "aiperf --request-count"
+        default: "200"
+
+# Cancel superseded PR runs; keep main builds.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  proxy-perf:
+    name: Proxy overhead (No-Op backend)
+    runs-on: ubuntu-latest
+
+    env:
+      PROXY_PORT: 4000
+      PERF_MODEL: noop
+      # gpt2 tokenizer is ~500 KB and downloads in < 2 s on Actions runners.
+      # It is only used for dataset-manager token counting; actual inference
+      # token counts come from the server (--use-server-token-count).
+      PERF_TOKENIZER: gpt2
+      PERF_CONCURRENCY: ${{ inputs.concurrency || '10' }}
+      PERF_REQUEST_COUNT: ${{ inputs.request_count || '200' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install switchyard (default extras only)
+        run: uv sync
+
+      - name: Install aiperf
+        run: uv pip install aiperf
+
+      # ------------------------------------------------------------------
+      # Start the proxy with the No-Op backend
+      # ------------------------------------------------------------------
+      - name: Start switchyard noop proxy
+        run: |
+          cat > bench.yaml <<'YAML'
+          routes:
+            noop:
+              type: noop
+          YAML
+          uv run switchyard --routing-profiles bench.yaml -- serve --port $PROXY_PORT &
+          echo "PROXY_PID=$!" >> "$GITHUB_ENV"
+
+      - name: Wait for proxy to be ready
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:$PROXY_PORT/health > /dev/null 2>&1; then
+              echo "Proxy is up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Proxy did not become ready in 30s"
+          exit 1
+
+      # ------------------------------------------------------------------
+      # Pre-build a minimal input dataset so aiperf doesn't need to
+      # download a HuggingFace tokenizer for synthetic data generation.
+      # Combined with --use-server-token-count this makes the benchmark
+      # completely self-contained (no network calls beyond the proxy).
+      # ------------------------------------------------------------------
+      - name: Generate perf input dataset
+        run: |
+          python3 - <<'PY'
+          import json
+          # 300 entries — enough to cycle through for any request-count
+          with open("perf-input.jsonl", "w") as f:
+              for _ in range(300):
+                  f.write(json.dumps({"text": "What is 2 + 2?"}) + "\n")
+          PY
+
+      # ------------------------------------------------------------------
+      # Run the benchmark
+      # ------------------------------------------------------------------
+      - name: Run aiperf benchmark (non-streaming)
+        run: |
+          mkdir -p perf-results
+          uv run aiperf profile \
+            --model "$PERF_MODEL" \
+            --tokenizer "$PERF_TOKENIZER" \
+            --url "http://localhost:$PROXY_PORT" \
+            --endpoint-type chat \
+            --concurrency "$PERF_CONCURRENCY" \
+            --request-count "$PERF_REQUEST_COUNT" \
+            --ui none \
+            --custom-dataset-type single-turn \
+            --input-file perf-input.jsonl \
+            --use-server-token-count \
+            --output-artifact-dir perf-results/non-streaming
+
+      - name: Run aiperf benchmark (streaming)
+        run: |
+          uv run aiperf profile \
+            --model "$PERF_MODEL" \
+            --tokenizer "$PERF_TOKENIZER" \
+            --url "http://localhost:$PROXY_PORT" \
+            --endpoint-type chat \
+            --streaming \
+            --concurrency "$PERF_CONCURRENCY" \
+            --request-count "$PERF_REQUEST_COUNT" \
+            --ui none \
+            --custom-dataset-type single-turn \
+            --input-file perf-input.jsonl \
+            --use-server-token-count \
+            --output-artifact-dir perf-results/streaming
+
+      # ------------------------------------------------------------------
+      # Stop proxy
+      # ------------------------------------------------------------------
+      - name: Stop proxy
+        if: always()
+        run: kill "$PROXY_PID" || true
+
+      # ------------------------------------------------------------------
+      # Upload results as a build artifact for comparison over time
+      # ------------------------------------------------------------------
+      - name: Upload perf results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: perf-results-${{ github.sha }}
+          path: perf-results/
+          retention-days: 90

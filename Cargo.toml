@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/switchyard-components",
+    "crates/switchyard-components-v2",
+    "crates/switchyard-components-v2-macros",
+    "crates/switchyard-core",
+    "crates/switchyard-py",
+    "crates/switchyard-server",
+    "crates/switchyard-translation",
+]
+
+[workspace.package]
+authors = ["NVIDIA Corporation"]
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/NVIDIA-dev/switchyard"
+rust-version = "1.94"

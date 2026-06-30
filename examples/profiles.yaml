@@ -1,0 +1,46 @@
+# Switchyard v2 profile config — the primary serve surface.
+#
+#   switchyard serve --config examples/profiles.yaml
+#
+# Each profile id and each target id is exposed as a model on GET /v1/models, so
+# a client (or `switchyard launch claude --model <id>`) selects a profile by id:
+#   fast            passthrough to the weak target
+#   smart-cascade   signal-based cascade routing between weak and strong
+#   weak / strong   the targets, addressable directly
+#
+# All profile types here are Rust-defined, so this file is served by the Rust
+# profile server. Files that include Python-defined profiles (see
+# examples/python_profile.yaml) use the Python FastAPI adapter.
+
+endpoints:
+  openrouter:
+    base_url: https://openrouter.ai/api/v1
+    api_key: ${OPENROUTER_API_KEY}
+
+targets:
+  strong:
+    endpoint: openrouter
+    model: anthropic/claude-opus-4.7
+    format: openai
+  weak:
+    endpoint: openrouter
+    model: moonshotai/kimi-k2.6
+    format: openai
+
+profiles:
+  fast:
+    type: passthrough
+    target: weak
+
+  smart-cascade:
+    type: cascade
+    strong: strong
+    weak: weak
+    fallback_target_on_evict: strong
+    picker: cascade_strong_default
+    confidence_threshold: 0.7
+    signal_recent_window: 3
+    classifier:
+      model: google/gemini-3.5-flash
+      api_key: ${OPENROUTER_API_KEY}
+      base_url: https://openrouter.ai/api/v1

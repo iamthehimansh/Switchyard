@@ -1,0 +1,63 @@
+name: README
+
+# Executable coverage for README.md.
+#
+# Fails when the README drifts from the product — a broken Python snippet, a
+# renamed YAML route type or key, or a renamed CLI subcommand / flag. The
+# exercise lives in tests/readme/ so it reproduces locally with
+# `uv run pytest tests/readme`.
+
+on:
+  pull_request:
+    paths:
+      - "README.md"
+      - "switchyard/**"
+      - "switchyard_rust/**"
+      - "tests/readme/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/readme.yml"
+  push:
+    branches: [main]
+    paths:
+      - "README.md"
+      - "switchyard/**"
+      - "switchyard_rust/**"
+      - "tests/readme/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/readme.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  readme:
+    name: Run README flow
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      - name: Install
+        run: uv sync --locked
+      - name: Exercise the README
+        # Single invocation: pytest picks up tests/readme/ (YAML schema + CLI
+        # checks) AND --markdown-docs execs the Python snippet from the README.
+        # The passthrough→noop fixture lives in tests/readme/conftest.py so it
+        # only loads when collecting from that subtree.
+        run: uv run pytest tests/readme --markdown-docs README.md -v
+        env:
+          # The YAML examples reference ${NVIDIA_API_KEY} etc.; stub so the
+          # bundle loader's env-var resolution doesn't fail on a clean runner.
+          # No value is ever sent upstream (schema validation only).
+          OPENAI_API_KEY: sk-test
+          NVIDIA_API_KEY: nvapi-test
+          ANTHROPIC_API_KEY: sk-ant-test

@@ -1,0 +1,10 @@
+.git
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.venv
+.worktrees
+benchmark/datasets
+benchmark/tb_runs
+dist
+site
