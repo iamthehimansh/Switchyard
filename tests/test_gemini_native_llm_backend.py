@@ -18,7 +18,7 @@ def _gemini_target(**overrides: object) -> LlmTarget:
         "model": "gemini-2.5-flash",
         "format": BackendFormat.GEMINI,
         "base_url": "https://generativelanguage.googleapis.com",
-        "api_key": "AIza-test",
+        "api_key": "AIza-test",  # pragma: allowlist secret
         "timeout_secs": 12.5,
     }
     data.update(overrides)
@@ -32,7 +32,7 @@ def test_constructs_from_resolved_gemini_target() -> None:
 
     assert backend.target == target
     assert backend.target.endpoint.base_url == "https://generativelanguage.googleapis.com"
-    assert backend.target.endpoint.api_key == "AIza-test"
+    assert backend.target.endpoint.api_key == "AIza-test"  # pragma: allowlist secret
     assert backend.target.endpoint.timeout_secs == 12.5
 
 
